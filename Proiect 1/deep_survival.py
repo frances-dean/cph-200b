@@ -14,10 +14,12 @@ import torch.optim as optim
 
 #######################################################################################
 
-class DeepSurvival(nn.Module):
+
+class SurvivalModel(nn.Module):
     """
-    Deep survival model class.
-    This class implements a deep learning model for survival analysis modeled after DeepSurv.
+    Deep learning survival model class. Probably closest resembeles CoxTime.
+
+    Replaces both baseline hazard and hazard ratio with a neural network.
 
     Parameters:
         df: DataFrame with time to event, event indicator, covariates
@@ -26,70 +28,96 @@ class DeepSurvival(nn.Module):
         covariates: list of column names for covariates
     """
     def __init__(self, df, covariates, 
-                hidden_dim = 128,
-                num_layers = 3,
-                num_time_predictions = 20,
-                use_bn: bool = True,
+                hidden_dims = [128, 128],
+                num_layers = [3, 3],
+                #num_time_predictions = 20, # Try implementing with time as input instead
+                use_bn = True,
+                learning_rate = 0.001,
                 censor_col='Censor (Censor = 1)', time_col='Survival Time'):
         
-        print('DeepSurv model initializing...')
+        print('Hazard model initializing...')
 
         # Data parameters
         self.df = df
         self.censor_col = censor_col
         self.time_col = time_col
         self.covariates = covariates
-        self.input_dim = len(covariates)
-        
-        print('Assume baseline hazard is constant at 1.0')
-        # TODO - implement baseline hazard as time dependent
-        self.baseline_hazard = 1.0
+        self.input_dim_hazard = len(covariates)+1 # +1 for time
 
         print('Predicting survival probabilities at 20 time points')
         self.num_time_predictions = num_time_predictions
 
-        # Initialize NN model (fully connected MLP)
+        # Initialize NN model (fully connected MLP) for hazard
         bias = not use_bn
 
         layers = []
-        if num_layers == 1:
-            layers.append(nn.Linear(input_dim, self.num_time_predictions))
-        elif num_layers > 1:
-            layers.append(nn.Linear(input_dim, hidden_dim, bias=bias))
+        if num_layers[0] == 1:
+            layers.append(nn.Linear(self.input_dim_hazard, 1)) # Try implementing as one output use time as input?
+        elif num_layers[0] > 1:
+            layers.append(nn.Linear(self.input_dim_hazard, hidden_dims[0], bias=bias))
             if use_bn:
-                layers.append(nn.BatchNorm1d(hidden_dim))
+                layers.append(nn.BatchNorm1d(hidden_dims[0]))
             layers.append(nn.ReLU())
             for _ in range(num_layers - 2):
-                layers.append(nn.Linear(hidden_dim, hidden_dim, bias=bias))
+                layers.append(nn.Linear(hidden_dims[0], hidden_dims[0], bias=bias))
                 if use_bn:
-                    layers.append(nn.BatchNorm1d(hidden_dim))
+                    layers.append(nn.BatchNorm1d(hidden_dims[0]))
                 layers.append(nn.ReLU())
-            layers.append(nn.Linear(hidden_dim, self.num_time_predictions))
+            layers.append(nn.Linear(hidden_dims[0],1))
 
-        self.model = nn.Sequential(*layers)
+        self.hazard_model = nn.Sequential(*layers)
+
+        # Initialize NN model (fully connected MLP) for baseline hazard
+        layers = []
+        if num_layers[1] == 1:
+            layers.append(nn.Linear(self.input_dim_hazard, 1))
+        elif num_layers[1] > 1:
+            layers.append(nn.Linear(self.input_dim_hazard, hidden_dims[1], bias=bias))
+            if use_bn:
+                layers.append(nn.BatchNorm1d(hidden_dims[1]))
+            layers.append(nn.ReLU())
+            for _ in range(num_layers - 2):
+                layers.append(nn.Linear(hidden_dims[1], hidden_dims[1], bias=bias))
+                if use_bn:
+                    layers.append(nn.BatchNorm1d(hidden_dims[1]))
+                layers.append(nn.ReLU())
+            layers.append(nn.Linear(hidden_dims[1], 1))
+
+        self.baseline_model = nn.Sequential(*layers)
 
         # Training parameters
-        self.optimizer = optim.Adam(self.model.parameters(), lr=0.001)
+        self.optimizer = optim.Adam(
+            list(self.hazard_model.parameters()) + list(self.baseline_model.parameters()), 
+            lr=learning_rate)
         print('DeepSurv model initialized.')
 
-    def forward(self, X):
+    def forward(self, X, t):
         """
-        Forward pass through DeepSurv model. This gives h_beta(X).
+        Forward pass gives the survival probabilities.
         """
-        return self.model(X)
+        h_betas = self.hazard_model(X, t)
+        baseline_hazard = self.baseline_model(X, t)
+        return baseline_hazard * torch.exp(h_betas)
         
     
-    def fit(self, X, epochs=1000, lr=0.01):
+    def fit(self, X, t, epochs=1000):
         """
         Fit DeepSurv model.
         """
         print('Fitting DeepSurv model...')
+        self.hazard_model.train()
+        self.baseline_model.train()
+
+        # Data
+        X = torch.tensor(self.df[self.covariates].values, dtype=torch.float32)
+        t = torch.tensor(self.df[self.time_col].values, dtype=torch.float32)
+
         for epoch in range(epochs):
             # Forward pass
-            h_betas = self.forward(X)
+            predictions = self.forward(X, t)
 
             # Compute partial log liklihood loss
-            loss = self.log_liklihood_loss(h_betas)
+            loss = -self.log_likelihood_loss(predictions)
 
             # Backward pass
             self.optimizer.zero_grad()
@@ -105,14 +133,74 @@ class DeepSurvival(nn.Module):
         """
         Predict survival probability from a covariate set.
         """
-        h_betas = self.forward(X)
-        return self.baseline_hazard * np.exp(h_betas)
+        self.hazard_model.eval()
+        self.baseline_model.eval()
+        return self.forward(X)
 
-    def log_liklihood_loss(self, h_betas):
+    def log_likelihood_loss(self, predictions):
         """
-        Compute loss function.
+        Compute loss function as partial log liklihood loss. 
+
+        Parameters:
+            predictions is the output of the forward pass, i.e. the hazard at time T_i given X_i, beta
+
         """
-        loss = 0
-        for i in range(len(self.df)):
-            loss += ??
-        return loss
+        order = torch.argsort(self.df[self.time_col], descending=False)
+        predictions = predictions[order]
+        print(predictions)
+        E = 1-self.df[self.censor_col][order]
+        hazard_term = torch.sum(E * torch.log(predictions)) 
+        print(torch.cumsum(predictions, dim=1))
+        survival_term = torch.sum(torch.log(torch.cumsum(predictions, dim=1)))
+        log_likelihood = hazard_term - survival_term
+        return log_likelihood
+    
+    def concordance_index(self):
+        """
+        Compute concordance index.
+
+        TODO - needs updated from Cox PH model.
+        """
+        time_values = self.df[self.time_col]
+        events = self.df[self.censor_col]
+        concordant = 0
+        discordant = 0
+        tied = 0
+
+        X = torch.tensor(self.df[self.covariates].values, dtype=torch.float32)
+
+        # First get gradients and Hessian
+        self.model.eval()  # Ensure the model is in evaluation mode
+    
+        # Forward pass to get the log-hazard predictions
+        predictions = self.model(X)
+
+        # Loop through all time comparisons
+        for i in range(len(time_values)):
+            for j in range(i + 1, len(time_values)):  # Ensure i != j
+                T_i = time_values.iloc[i]
+                T_j = time_values.iloc[j]
+                
+                # If T_i < T_j and individual i survived shorter
+                if (T_i < T_j ) & (events[i]==0):
+                    if predictions[i] > predictions[j]: # Exp is monotonically increasing so beta * X is fine to compare
+                        concordant+=1
+                    else:
+                        discordant+=1
+                if (T_i > T_j ) & (events[j]==0):
+                    if predictions[i] < predictions[j]: 
+                        concordant+=1
+                    else:
+                        discordant+=1
+                if (T_i == T_j ) & ((events[i]==0) & (events[j]==0)): 
+                    tied+=1
+
+        total_pairs = concordant + discordant + tied
+        
+        # Catch for no comparable
+        if total_pairs == 0:
+            return np.nan  # If no pairs were comparable
+
+        c_index = concordant / total_pairs
+        return c_index
+#######################################################################################
