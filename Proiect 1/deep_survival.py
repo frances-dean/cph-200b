@@ -44,8 +44,8 @@ class SurvivalModel(nn.Module):
         self.covariates = covariates
         self.input_dim_hazard = len(covariates)+1 # +1 for time
 
-        print('Predicting survival probabilities at 20 time points')
-        self.num_time_predictions = num_time_predictions
+        #print('Predicting survival probabilities at 20 time points')
+        #self.num_time_predictions = num_time_predictions
 
         # Initialize NN model (fully connected MLP) for hazard
         bias = not use_bn
