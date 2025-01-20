@@ -34,7 +34,7 @@ class SurvivalModel(nn.Module):
                 use_bn = True,
                 learning_rate = 0.001,
                 censor_col='Censor (Censor = 1)', time_col='Survival Time'):
-        
+        super(SurvivalModel, self).__init__()
         print('Hazard model initializing...')
 
         # Data parameters
@@ -58,12 +58,14 @@ class SurvivalModel(nn.Module):
             if use_bn:
                 layers.append(nn.BatchNorm1d(hidden_dims[0]))
             layers.append(nn.ReLU())
-            for _ in range(num_layers - 2):
+            for _ in range(num_layers[0] - 2):
                 layers.append(nn.Linear(hidden_dims[0], hidden_dims[0], bias=bias))
                 if use_bn:
                     layers.append(nn.BatchNorm1d(hidden_dims[0]))
                 layers.append(nn.ReLU())
             layers.append(nn.Linear(hidden_dims[0],1))
+            # Need hazards to be positive
+            layers.append(nn.Softplus())
 
         self.hazard_model = nn.Sequential(*layers)
 
@@ -76,12 +78,14 @@ class SurvivalModel(nn.Module):
             if use_bn:
                 layers.append(nn.BatchNorm1d(hidden_dims[1]))
             layers.append(nn.ReLU())
-            for _ in range(num_layers - 2):
+            for _ in range(num_layers[1] - 2):
                 layers.append(nn.Linear(hidden_dims[1], hidden_dims[1], bias=bias))
                 if use_bn:
                     layers.append(nn.BatchNorm1d(hidden_dims[1]))
                 layers.append(nn.ReLU())
             layers.append(nn.Linear(hidden_dims[1], 1))
+            # Need hazards to be positive
+            layers.append(nn.Softplus())
 
         self.baseline_model = nn.Sequential(*layers)
 
@@ -89,18 +93,18 @@ class SurvivalModel(nn.Module):
         self.optimizer = optim.Adam(
             list(self.hazard_model.parameters()) + list(self.baseline_model.parameters()), 
             lr=learning_rate)
-        print('DeepSurv model initialized.')
+        print('SurvivalModel initialized.')
 
-    def forward(self, X, t):
+    def forward(self, combined_tensor):
         """
         Forward pass gives the survival probabilities.
         """
-        h_betas = self.hazard_model(X, t)
-        baseline_hazard = self.baseline_model(X, t)
+        h_betas = self.hazard_model(combined_tensor)
+        baseline_hazard = self.baseline_model(combined_tensor)
         return baseline_hazard * torch.exp(h_betas)
         
     
-    def fit(self, X, t, epochs=1000):
+    def fit(self, epochs=1000):
         """
         Fit DeepSurv model.
         """
@@ -111,10 +115,12 @@ class SurvivalModel(nn.Module):
         # Data
         X = torch.tensor(self.df[self.covariates].values, dtype=torch.float32)
         t = torch.tensor(self.df[self.time_col].values, dtype=torch.float32)
+        combined_tensor = torch.cat((X, t.unsqueeze(1)), dim=1)
 
         for epoch in range(epochs):
             # Forward pass
-            predictions = self.forward(X, t)
+            predictions = self.forward(combined_tensor)
+            predictions = torch.clamp(predictions, min=1e-6)  # Prevent log(0) error
 
             # Compute partial log liklihood loss
             loss = -self.log_likelihood_loss(predictions)
@@ -129,13 +135,39 @@ class SurvivalModel(nn.Module):
                 print(f"Epoch {epoch}, Loss: {loss:.4f}")
         print('Fitting done.')
 
-    def predict(self, X):
+    def predict(self, combined_tensor):
         """
         Predict survival probability from a covariate set.
         """
         self.hazard_model.eval()
         self.baseline_model.eval()
-        return self.forward(X)
+        return self.forward(combined_tensor)
+    
+    def plot_average_survival(self, test_df=None):
+        """
+        Plot average survival curve.
+
+        TODO - FINISH IMPLEMENTATION
+        """
+        if test_df is not None:
+            df = test_df
+        else:
+            df = self.df
+        time_values = df[self.time_col]
+        events = df[self.censor_col]
+
+        X = torch.tensor(df[self.covariates].values, dtype=torch.float32)
+        t = torch.tensor(df[self.time_col].values, dtype=torch.float32)
+        combined_tensor = torch.cat((X, t.unsqueeze(1)), dim=1)
+
+        predictions = self.predict(combined_tensor)
+
+        plt.figure(figsize=(10, 6))
+        plt.title('Average Survival Curve')
+        plt.xlabel('Time')
+        plt.ylabel('Survival Probability')
+        plt.grid(True)
+        plt.show()
 
     def log_likelihood_loss(self, predictions):
         """
@@ -145,35 +177,45 @@ class SurvivalModel(nn.Module):
             predictions is the output of the forward pass, i.e. the hazard at time T_i given X_i, beta
 
         """
-        order = torch.argsort(self.df[self.time_col], descending=False)
+        time_tensor = torch.tensor(self.df[self.time_col].values, dtype=torch.float32)
+        order = torch.argsort(time_tensor, descending=False)#.numpy()
         predictions = predictions[order]
-        print(predictions)
-        E = 1-self.df[self.censor_col][order]
+        E = 1 - torch.tensor(self.df[self.censor_col].iloc[order].values, dtype=torch.float32)
+        E = E.unsqueeze(1)
+        #predictions = predictions.squeeze() 
         hazard_term = torch.sum(E * torch.log(predictions)) 
-        print(torch.cumsum(predictions, dim=1))
-        survival_term = torch.sum(torch.log(torch.cumsum(predictions, dim=1)))
+        
+        survival_term = torch.sum(torch.log(torch.cumsum(predictions, dim=0)))
+        
         log_likelihood = hazard_term - survival_term
         return log_likelihood
     
-    def concordance_index(self):
+    def concordance_index(self, test_df=None):
         """
         Compute concordance index.
 
-        TODO - needs updated from Cox PH model.
+        TODO - finish updating from Cox PH model.
         """
-        time_values = self.df[self.time_col]
-        events = self.df[self.censor_col]
+        if test_df is not None:
+            df = test_df
+        else:
+            df = self.df
+        time_values = df[self.time_col]
+        events = df[self.censor_col]
         concordant = 0
         discordant = 0
         tied = 0
 
-        X = torch.tensor(self.df[self.covariates].values, dtype=torch.float32)
+        X = torch.tensor(df[self.covariates].values, dtype=torch.float32)
+        t = torch.tensor(df[self.time_col].values, dtype=torch.float32)
+        combined_tensor = torch.cat((X, t.unsqueeze(1)), dim=1)
 
         # First get gradients and Hessian
-        self.model.eval()  # Ensure the model is in evaluation mode
+        self.hazard_model.eval()
+        self.baseline_model.eval()  # Ensure the models are in evaluation mode
     
         # Forward pass to get the log-hazard predictions
-        predictions = self.model(X)
+        predictions = self.forward(combined_tensor)
 
         # Loop through all time comparisons
         for i in range(len(time_values)):
