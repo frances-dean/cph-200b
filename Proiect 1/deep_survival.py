@@ -226,7 +226,7 @@ class SurvivalModel(nn.Module):
 
         """
         time_tensor = torch.tensor(self.df[self.time_col].values, dtype=torch.float32)
-        order = torch.argsort(time_tensor, descending=True)#.numpy()
+        order = torch.argsort(time_tensor, descending=False)#.numpy()
         predictions = predictions[order]
         E = 1 - torch.tensor(self.df[self.censor_col].iloc[order].values, dtype=torch.float32)
         E = E.unsqueeze(1)
