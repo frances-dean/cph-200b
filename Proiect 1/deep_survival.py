@@ -29,10 +29,10 @@ class SurvivalModel(nn.Module):
     """
     def __init__(self, df, covariates, 
                 hidden_dims = [128, 128],
-                num_layers = [3, 3],
+                num_layers = [5, 5],
                 #num_time_predictions = 20, # Try implementing with time as input instead
                 use_bn = True,
-                learning_rate = 0.001,
+                learning_rate = 0.0001,
                 censor_col='Censor (Censor = 1)', time_col='Survival Time'):
         super(SurvivalModel, self).__init__()
         print('Hazard model initializing...')
@@ -41,6 +41,7 @@ class SurvivalModel(nn.Module):
         self.df = df
         self.censor_col = censor_col
         self.time_col = time_col
+        self.max_time = df[time_col].max()
         self.covariates = covariates
         self.input_dim_hazard = len(covariates)+1 # +1 for time
 
@@ -104,7 +105,7 @@ class SurvivalModel(nn.Module):
         return baseline_hazard * torch.exp(h_betas)
         
     
-    def fit(self, epochs=1000):
+    def fit(self, epochs=500):
         """
         Fit DeepSurv model.
         """
@@ -135,38 +136,85 @@ class SurvivalModel(nn.Module):
                 print(f"Epoch {epoch}, Loss: {loss:.4f}")
         print('Fitting done.')
 
-    def predict(self, combined_tensor):
+    def predict(self, X, times=None):
         """
         Predict survival probability from a covariate set.
+
+        Parameters:
+            X: covariate tensor of shape (N, C), where N is the number of data points and C is the number of covariates.
+            times: time tensor list of the times to predict the survival curve for,
+                defaults to 20 evenly spaced points in the range of training data.
+
+        Returns:
+            Predicted survival probabilities for each data point and time point.
+            Shape: (N, T), where T is the number of time points.
         """
+        if times is None:
+            times = torch.linspace(0, self.max_time, steps=20)
+
+        print('Predicting survival probabilities...')
+
+        # Ensure `times` has shape (T, 1), where T is the number of time points
+        times_tensor = times.unsqueeze(1)  # Shape (T, 1)
+
+        # Repeat `times_tensor` for each data point in X
+        times_tensor = times_tensor.repeat(1, X.shape[0]).T  # Shape (N, T)
+
+        # Combine covariates and repeated times along the feature dimension
+        # Expand times along the last dimension to match the covariate dimension
+        combined_tensor = torch.cat((X.unsqueeze(1).repeat(1, times_tensor.shape[1], 1), times_tensor.unsqueeze(2)), dim=2)
+
+        # Flatten combined tensor for model input: (N * T, C + 1)
+        combined_tensor = combined_tensor.view(-1, combined_tensor.shape[2])
+
+        # Set models to evaluation mode
         self.hazard_model.eval()
         self.baseline_model.eval()
-        return self.forward(combined_tensor)
+
+        # Forward pass through the model
+        with torch.no_grad():
+            predictions = self.forward(combined_tensor)  # Model expects input of shape (N * T, C + 1)
+
+        # Reshape predictions to (N, T)
+        predictions = predictions.view(X.shape[0], times_tensor.shape[1])
+
+        return predictions
+
+    
+    def compute_survival_from_hazard(self, hazards):
+        """
+        Compute the survival function from predicted hazards. 
+
+        Parameters:
+            hazards: Tensor of predicted hazards of shape (N, T),
+                    where N is the number of data points and T is the number of time points.
+        """
+        cumulative_hazard = torch.cumsum(hazards, dim=1)  # Shape: (N, T)
+        survival = torch.exp(-cumulative_hazard)  # Shape: (N, T)
+
+        return survival
     
     def plot_average_survival(self, test_df=None):
         """
         Plot average survival curve.
 
-        TODO - FINISH IMPLEMENTATION
+        Parameters:
+            test_df: DataFrame to predict survival curve for
         """
         if test_df is not None:
             df = test_df
         else:
             df = self.df
-        time_values = df[self.time_col]
-        events = df[self.censor_col]
 
         X = torch.tensor(df[self.covariates].values, dtype=torch.float32)
-        t = torch.tensor(df[self.time_col].values, dtype=torch.float32)
-        combined_tensor = torch.cat((X, t.unsqueeze(1)), dim=1)
-
-        predictions = self.predict(combined_tensor)
-
+        times = np.linspace(0, self.max_time, num=20)
+        predictions = self.compute_survival_from_hazard(self.predict(X)).detach().numpy()
+        #print(predictions)
         plt.figure(figsize=(10, 6))
+        plt.plot(times, np.mean(predictions, axis=0))
         plt.title('Average Survival Curve')
         plt.xlabel('Time')
         plt.ylabel('Survival Probability')
-        plt.grid(True)
         plt.show()
 
     def log_likelihood_loss(self, predictions):
@@ -178,7 +226,7 @@ class SurvivalModel(nn.Module):
 
         """
         time_tensor = torch.tensor(self.df[self.time_col].values, dtype=torch.float32)
-        order = torch.argsort(time_tensor, descending=False)#.numpy()
+        order = torch.argsort(time_tensor, descending=True)#.numpy()
         predictions = predictions[order]
         E = 1 - torch.tensor(self.df[self.censor_col].iloc[order].values, dtype=torch.float32)
         E = E.unsqueeze(1)
@@ -193,15 +241,14 @@ class SurvivalModel(nn.Module):
     def concordance_index(self, test_df=None):
         """
         Compute concordance index.
-
-        TODO - finish updating from Cox PH model.
         """
         if test_df is not None:
             df = test_df
         else:
             df = self.df
+        
         time_values = df[self.time_col]
-        events = df[self.censor_col]
+        events = df[self.censor_col] # censoring indicator
         concordant = 0
         discordant = 0
         tied = 0
@@ -215,7 +262,12 @@ class SurvivalModel(nn.Module):
         self.baseline_model.eval()  # Ensure the models are in evaluation mode
     
         # Forward pass to get the log-hazard predictions
-        predictions = self.forward(combined_tensor)
+        with torch.no_grad():
+            predictions = self.forward(combined_tensor)
+            #print(predictions)
+            #print(predictions.shape)
+            predictions = predictions.detach().numpy().flatten()
+        
 
         # Loop through all time comparisons
         for i in range(len(time_values)):
@@ -224,17 +276,17 @@ class SurvivalModel(nn.Module):
                 T_j = time_values.iloc[j]
                 
                 # If T_i < T_j and individual i survived shorter
-                if (T_i < T_j ) & (events[i]==0):
-                    if predictions[i] > predictions[j]: # Exp is monotonically increasing so beta * X is fine to compare
+                if (T_i < T_j ) & (events.iloc[i]==0):
+                    if predictions[i] > predictions[j]: # hazard of X, t
                         concordant+=1
                     else:
                         discordant+=1
-                if (T_i > T_j ) & (events[j]==0):
+                if (T_i > T_j ) & (events.iloc[j]==0):
                     if predictions[i] < predictions[j]: 
                         concordant+=1
                     else:
                         discordant+=1
-                if (T_i == T_j ) & ((events[i]==0) & (events[j]==0)): 
+                if (T_i == T_j ) & ((events.iloc[i]==0) & (events.iloc[j]==0)): 
                     tied+=1
 
         total_pairs = concordant + discordant + tied
