@@ -33,10 +33,10 @@ class SurvivalModel(nn.Module):
         domain_adapatation_model (optional): model to predict probability of data being from uncensored data.
     """
     def __init__(self, df, covariates, 
-                hidden_dims = [128, 128, 64],
-                num_layers = [5, 5, 5],
+                hidden_dims = [256, 256],
+                num_layers = [5, 5],
                 use_bn = True,
-                learning_rate = 0.01,
+                learning_rate = 0.001,
                 censor_col='Censor (Censor = 1)', time_col='Survival Time',
                 domain_adapatation_model = None):
         super(SurvivalModel, self).__init__()
@@ -150,10 +150,7 @@ class SurvivalModel(nn.Module):
                 # Compute cox proportional hazard loss
                 events_observed = 1 - torch.tensor(self.df[self.censor_col].iloc[indices][i:i+batch_size].values, dtype=torch.float)
                 durations = torch.tensor(self.df[self.time_col].iloc[indices][i:i+batch_size].values, dtype=torch.float)
-                if self.domain_adapatation_model is not None:
-                    loss = -self.log_likelihood_loss(events_observed, durations, predictions, X[i:i+batch_size]) #+ self.concordance_index()
-                else:
-                    loss = -self.log_likelihood_loss(events_observed, durations, predictions)
+                loss = -self.log_likelihood_loss(events_observed, durations, predictions, X[i:i+batch_size]) #+ -self.concordance_index()
                 #loss = CoxPHLoss()(predictions, durations, events_observed)
 
                 # Backward pass
@@ -269,10 +266,10 @@ class SurvivalModel(nn.Module):
         weights = torch.ones_like(E) # Default to 1
         if self.domain_adapatation_model is not None:
             # Domain adaptation model predicts probability X is is from uncensored data
-            g = self.domain_adapatation_model(X) # X is shape (N, |X|) so g is shape (N, 1)
-
+            g = self.domain_adapatation_model(X) + 1e-6 # X is shape (N, |X|) so g is shape (N, 1)
+            
             # We implement weight which adds higher weight to uncensored data, per slide 32 of Lecture 4
-            weights = torch.tensor((1-g)/g, dtype=torch.float32) # Shape (N, 1)
+            weights = torch.tensor(torch.clamp((1-g)/g,min=0.0,max=10.0), dtype=torch.float32) # Shape (N, 1)
         
         survival_predictions = self.compute_survival_from_hazard(predictions)  # Cumulative sum of predicted hazards
         #print(survival_predictions)
@@ -342,6 +339,71 @@ class SurvivalModel(nn.Module):
 
         c_index = concordant / total_pairs
         return c_index
+    
+    def faster_concordance_index(self, test_df=None):
+        """
+        Compute concordance index in a more efficient way. Thanks GPT.
+
+        """
+        if test_df is not None:
+            df = test_df
+        else:
+            df = self.df
+
+        time_values = df[self.time_col].values
+        events = df[self.censor_col].values  # censoring indicator
+
+        X = torch.tensor(df[self.covariates].values, dtype=torch.float32)
+        t = torch.tensor(time_values, dtype=torch.float32)
+        combined_tensor = torch.cat((X, t.unsqueeze(1)), dim=1)
+
+        # Get predictions in evaluation mode
+        self.hazard_model.eval()
+        self.baseline_model.eval()
+
+        with torch.no_grad():
+            predictions = self.forward(combined_tensor).numpy().flatten()
+
+        # Efficient pairwise computation of concordance, discordance, and ties
+        concordant = 0
+        discordant = 0
+        tied = 0
+
+        # Compare all pairs using broadcasting
+        time_diff = time_values[:, None] - time_values  # Pairwise time difference
+        event_diff = events[:, None] - events  # Pairwise event difference
+        pred_diff = predictions[:, None] - predictions  # Pairwise prediction difference
+
+        # Create a mask where pairs are comparable (time_i != time_j)
+        mask_comparable = (time_diff != 0) & (event_diff == 0)
+
+        # Concordant pairs: If one individual survived shorter but has higher hazard
+        concordant_pairs = (mask_comparable & (time_diff < 0) & (pred_diff > 0)) | \
+                        (mask_comparable & (time_diff > 0) & (pred_diff < 0))
+
+        # Discordant pairs: If one individual survived shorter but has lower hazard
+        discordant_pairs = (mask_comparable & (time_diff < 0) & (pred_diff < 0)) | \
+                            (mask_comparable & (time_diff > 0) & (pred_diff > 0))
+
+        # Tied pairs: If times are equal and both events are censored
+        tied_pairs = (time_diff == 0) & (event_diff == 0)
+
+        # Count each type of pair
+        concordant = np.sum(concordant_pairs)
+        discordant = np.sum(discordant_pairs)
+        tied = np.sum(tied_pairs)
+
+        # Total pairs
+        total_pairs = concordant + discordant + tied
+
+        # Catch for no comparable pairs
+        if total_pairs == 0:
+            return np.nan
+
+        # Calculate concordance index
+        c_index = concordant / total_pairs
+        return c_index
+
 
 #######################################################################################
 # Domain classifier model
