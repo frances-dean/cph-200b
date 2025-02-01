@@ -8,14 +8,16 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 
+from sklearn.metrics import roc_curve, auc
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
 
-from pycox.models.loss import CoxPHLoss
+#from pycox.models.loss import CoxPHLoss
 
 #######################################################################################
-
+# Deep survvival model
 
 class SurvivalModel(nn.Module):
     """
@@ -28,12 +30,13 @@ class SurvivalModel(nn.Module):
         event_col: column name for event indicator. Currently its a censoring indicator.
         time_col: column name for time to event.
         covariates: list of column names for covariates to use.
+        domain_adapatation_model (optional): model to predict probability of data being from uncensored data.
     """
     def __init__(self, df, covariates, 
                 hidden_dims = [128, 128, 64],
                 num_layers = [5, 5, 5],
                 use_bn = True,
-                learning_rate = 0.001,
+                learning_rate = 0.01,
                 censor_col='Censor (Censor = 1)', time_col='Survival Time',
                 domain_adapatation_model = None):
         super(SurvivalModel, self).__init__()
@@ -147,7 +150,10 @@ class SurvivalModel(nn.Module):
                 # Compute cox proportional hazard loss
                 events_observed = 1 - torch.tensor(self.df[self.censor_col].iloc[indices][i:i+batch_size].values, dtype=torch.float)
                 durations = torch.tensor(self.df[self.time_col].iloc[indices][i:i+batch_size].values, dtype=torch.float)
-                loss = -self.log_likelihood_loss(events_observed, durations, predictions) #+ self.concordance_index()
+                if self.domain_adapatation_model is not None:
+                    loss = -self.log_likelihood_loss(events_observed, durations, predictions, X[i:i+batch_size]) #+ self.concordance_index()
+                else:
+                    loss = -self.log_likelihood_loss(events_observed, durations, predictions)
                 #loss = CoxPHLoss()(predictions, durations, events_observed)
 
                 # Backward pass
@@ -336,4 +342,123 @@ class SurvivalModel(nn.Module):
 
         c_index = concordant / total_pairs
         return c_index
+
 #######################################################################################
+# Domain classifier model
+
+class DomainClassifier(nn.Module):
+    """
+    Domain classifier model class. Used to predict the probability of data being from uncensored data.
+
+    Parameters:
+        input_dim: dimension of input data.
+        hidden_dims: list of hidden layer dimensions.
+        num_layers: number of hidden layers.
+        learning_rate: learning rate for optimizer.
+    """
+    def __init__(self, input_dim, hidden_dims=128, num_layers=5, learning_rate=0.001):
+        super(DomainClassifier, self).__init__()
+        print('Domain classifier initializing...')
+
+        # Initialize NN model (fully connected MLP)
+        bias = True
+        layers = []
+        if num_layers == 1:
+            layers.append(nn.Linear(input_dim, 1))
+        elif num_layers > 1:
+            layers.append(nn.Linear(input_dim, hidden_dims, bias=bias))
+            layers.append(nn.ReLU())
+            for _ in range(num_layers - 2):
+                layers.append(nn.Linear(hidden_dims, hidden_dims, bias=bias))
+                layers.append(nn.ReLU())
+            layers.append(nn.Linear(hidden_dims, 1))
+            layers.append(nn.Sigmoid())
+
+        self.model = nn.Sequential(*layers)
+
+        # Training parameters
+        self.optimizer = optim.Adam(self.model.parameters(), lr=learning_rate)
+        print('Domain classifier initialized.')
+
+    def forward(self, X):
+        """
+        Forward pass gives the probability of data being from uncensored data.
+
+        X: input tensor of shape (N, |X|), where N is the number of data points and |X| is the number of covariates.
+        """
+        return self.model(X)
+
+    def fit(self, X, y, epochs=50, batch_size=32):
+        """
+        Fit domain classifier model. Also implements batch training in fit for "simplicity."
+
+        Parameters:
+            X: input tensor of shape (N, |X|), where N is the number of data points and |X| is the number of covariates.
+            y: target tensor of whether is in the source (uncensored class) shape (N, 1).
+            epochs: number of training epochs.
+            batch_size: size of training batches.
+        """
+        # Shuffle data
+        indices = torch.randperm(len(X))
+        X = torch.tensor(X.values, dtype=torch.float32) # Shape (N, |X|)
+        y = torch.tensor(y.values, dtype=torch.float32) # Shape (N, 1)
+
+        print('Fitting domain classifier...')
+        self.model.train()
+
+        # Training loop
+        for epoch in range(epochs):
+            # Shuffle data
+            indices = torch.randperm(len(X))
+            X = X[indices]
+            y = y[indices]
+
+            for i in range(0, len(X), batch_size):
+                X_batch = X[i:i+batch_size]
+                y_batch = y[i:i+batch_size]
+
+                # Forward pass
+                predictions = self.forward(X_batch) # Shape (batch_size,)
+                
+                loss = nn.BCELoss()(predictions.flatten(), y_batch)
+
+                # Backward pass
+                self.optimizer.zero_grad()
+                loss.backward()
+                self.optimizer.step()
+
+            # Print every 10 epochs
+            if epoch % 10 == 0:
+                print(f"Epoch {epoch}, Loss: {loss:.4f}")
+            
+        print('Done fitting domain claissifier.')
+
+    def predict(self, X):
+        """
+        Predict probability of data being from uncensored data.
+        
+        X: input tensor of shape (N, |X|), where N is the number of data points and |X| is the number of covariates.
+        
+        Returns:
+            Predicted probabilities of data being from uncensored data. Shape: (N, 1)
+
+        """
+        X = torch.tensor(X.values, dtype=torch.float32) # Shape (N, |X|)
+        
+        self.model.eval()
+        with torch.no_grad():
+            predictions = self.forward(X)
+
+        return predictions
+
+    def get_auc(self, X, y):
+        """
+        Compute AUC for domain classifier on test data.
+        """
+
+        predictions = self.predict(X).detach().numpy().flatten()
+
+        fpr, tpr, _ = roc_curve(y, predictions)
+        auc_score = auc(fpr, tpr)
+
+        return auc_score
