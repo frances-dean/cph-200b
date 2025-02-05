@@ -8,7 +8,7 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 
-from lifelines.utils import concordance_index
+# from lifelines.utils import concordance_index
 
 #######################################################################################
 
@@ -76,7 +76,7 @@ def fit_k_nn_km(k, df, idx, covariates,time_col='time',event_col='DEATH_EVENT'):
 
 def normalize_features(df, covariates):
   """
-  Normalize features in DataFrame.
+  Normalize features in DataFrame in place. Assumes they are all numerical, continuous. 
   """
   for covariate in covariates:
     df[covariate] = (df[covariate] - df[covariate].mean()) / df[covariate].std()

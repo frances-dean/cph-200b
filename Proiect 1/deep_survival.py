@@ -14,7 +14,9 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 
-#from pycox.models.loss import CoxPHLoss
+from torch.optim.lr_scheduler import StepLR
+
+from pycox.models.loss import CoxPHLoss 
 
 #######################################################################################
 # Deep survvival model
@@ -36,7 +38,7 @@ class SurvivalModel(nn.Module):
                 hidden_dims = [256, 256],
                 num_layers = [5, 5],
                 use_bn = True,
-                learning_rate = 0.001,
+                learning_rate = 0.0001,
                 censor_col='Censor (Censor = 1)', time_col='Survival Time',
                 domain_adapatation_model = None):
         super(SurvivalModel, self).__init__()
@@ -46,10 +48,12 @@ class SurvivalModel(nn.Module):
         self.df = df
         self.censor_col = censor_col
         self.time_col = time_col
+        #self.mean = df[time_col].mean()
+        #self.std = df[time_col].std()
+        #self.df[self.time_col] = (self.df[self.time_col] -  self.mean)/self.std   # Normalize time to [0, 1]...
         self.max_time = df[time_col].max()
-        self.df[self.time_col] /= self.max_time  # Normalize time to [0, 1]...
         self.covariates = covariates
-        self.input_dim_hazard = len(covariates)+1 # +1 for time
+        self.input_dim_hazard = len(covariates) # +1 for time
 
         # Initialize NN model (fully connected MLP) for HAZARD RATIO
         bias = not use_bn
@@ -61,15 +65,15 @@ class SurvivalModel(nn.Module):
             ratio_layers.append(nn.Linear(self.input_dim_hazard, hidden_dims[0], bias=bias))
             if use_bn:
                 ratio_layers.append(nn.BatchNorm1d(hidden_dims[0]))
-            ratio_layers.append(nn.ReLU())
+            ratio_layers.append(nn.LeakyReLU(negative_slope=0.01)) #nn.ReLU()
             for _ in range(num_layers[0] - 2):
                 ratio_layers.append(nn.Linear(hidden_dims[0], hidden_dims[0], bias=bias))
                 if use_bn:
                     ratio_layers.append(nn.BatchNorm1d(hidden_dims[0]))
-                ratio_layers.append(nn.ReLU())
+                ratio_layers.append(nn.LeakyReLU(negative_slope=0.01))
             ratio_layers.append(nn.Linear(hidden_dims[0],1))
             
-            # # Need hazards to be positive
+            # # DONT Need hazards to be positive
             # hazard_layers.append(nn.Softplus())
 
         self.hazard_model = nn.Sequential(*ratio_layers)
@@ -77,20 +81,20 @@ class SurvivalModel(nn.Module):
         # Initialize NN model (fully connected MLP) for BASELINE hazard
         baseline_layers = []
         if num_layers[1] == 1:
-            baseline_layers.append(nn.Linear(self.input_dim_hazard, 1))
+            baseline_layers.append(nn.Linear(self.input_dim_hazard+1, 1))
         elif num_layers[1] > 1:
-            baseline_layers.append(nn.Linear(self.input_dim_hazard, hidden_dims[1], bias=bias))
+            baseline_layers.append(nn.Linear(self.input_dim_hazard+1, hidden_dims[1], bias=bias))
             if use_bn:
                 baseline_layers.append(nn.BatchNorm1d(hidden_dims[1]))
-            baseline_layers.append(nn.ReLU())
+            baseline_layers.append(nn.LeakyReLU(negative_slope=0.01))
             for _ in range(num_layers[1] - 2):
                 baseline_layers.append(nn.Linear(hidden_dims[1], hidden_dims[1], bias=bias))
                 if use_bn:
                     baseline_layers.append(nn.BatchNorm1d(hidden_dims[1]))
-                baseline_layers.append(nn.ReLU())
+                baseline_layers.append(nn.LeakyReLU(negative_slope=0.01))
             baseline_layers.append(nn.Linear(hidden_dims[1], 1))
             
-            # Need baseline hazards to be positive too
+            # Need baseline hazards to be positive tho
             baseline_layers.append(nn.Softplus())
 
         self.baseline_model = nn.Sequential(*baseline_layers)
@@ -99,10 +103,15 @@ class SurvivalModel(nn.Module):
         self.optimizer = optim.Adam(
             list(self.hazard_model.parameters()) + list(self.baseline_model.parameters()), 
             lr=learning_rate)
-        print('SurvivalModel initialized.')
+        
+
+        # Learning rate scheduler (e.g., StepLR) .. hopefully helps with learning... doesn't
+        self.scheduler = StepLR(self.optimizer, step_size=10, gamma=0.005)  # Decay LR by 0.005 every 10 epochs
 
         # Domain adaptation model - None if not used
         self.domain_adapatation_model = domain_adapatation_model
+
+        print('SurvivalModel initialized.')
 
     def forward(self, combined_tensor):
         """
@@ -111,7 +120,8 @@ class SurvivalModel(nn.Module):
         combined_tensor: tensor of shape (N, |X| + 1), where N is the number of data points and 
                         |X| is the number of covariates plus 1 for the time variable.
         """
-        h_betas = self.hazard_model(combined_tensor)
+        
+        h_betas = self.hazard_model(combined_tensor[:, :-1]) # t doesnt affect hazard ratio
         baseline_hazard = self.baseline_model(combined_tensor)
         return baseline_hazard * torch.exp(h_betas)
         
@@ -148,16 +158,33 @@ class SurvivalModel(nn.Module):
                 predictions = torch.clamp(predictions, min=1e-6)  # Prevent log(0) error
 
                 # Compute cox proportional hazard loss
-                events_observed = 1 - torch.tensor(self.df[self.censor_col].iloc[indices][i:i+batch_size].values, dtype=torch.float)
+                events_observed = 1-torch.tensor(self.df[self.censor_col].iloc[indices][i:i+batch_size].values, dtype=torch.float)
                 durations = torch.tensor(self.df[self.time_col].iloc[indices][i:i+batch_size].values, dtype=torch.float)
-                loss = -self.log_likelihood_loss(events_observed, durations, predictions, X[i:i+batch_size]) #+ -self.concordance_index()
-                #loss = CoxPHLoss()(predictions, durations, events_observed)
-
+                
+                # Loss
+                # tried full log likelihood
+                #loss = -self.log_likelihood_loss(events_observed, durations, predictions, X[i:i+batch_size]) 
+                # concordance doesn't work
+                #loss = 1-self.faster_concordance_index()
+                
+                # partial log likelihood works
+                if self.domain_adapatation_model is None:
+                    loss = CoxPHLoss()(predictions, durations, events_observed)
+                else:
+                    loss = -self.partial_log_likelihood_loss(events_observed, durations, predictions, X[i:i+batch_size]) 
+                
                 # Backward pass
                 self.optimizer.zero_grad()
                 loss.backward()
                 self.optimizer.step()
-                
+
+            # Update learning rate
+            self.scheduler.step()
+
+            # # Checking if vanishing gradients are part of getting same survival curve 
+            # for param in self.baseline_model.parameters():
+            #     print(param.grad)  # Some of the gradients are pretty small?  is this part of learning issue?
+            
             # Print every 10 epochs
             if epoch % 10 == 0:
                 print(f"Epoch {epoch}, Loss: {loss:.4f}")
@@ -179,7 +206,7 @@ class SurvivalModel(nn.Module):
             Shape: (N, T), where T is the number of time points.
         """
         if times is None:
-            times = torch.linspace(0, 1, steps=20) # Times are scaled to be between 0 and 1.
+            times = torch.linspace(0, self.max_time, steps=20) # Times are scaled to be between 0 and 1.
 
         print('Predicting survival probabilities...')
 
@@ -218,7 +245,7 @@ class SurvivalModel(nn.Module):
             hazards: Tensor of predicted hazards of shape (N, T),
                     where N is the number of data points and T is the number of time points.
         """
-        cumulative_hazard = torch.cumsum(torch.clamp(hazards, min=1e-6), dim=1)  # Shape: (N, T)
+        cumulative_hazard = torch.cumsum((hazards), dim=1)  # Shape: (N, T)
         survival = torch.exp(-cumulative_hazard)  # Shape: (N, T)
 
         return survival
@@ -243,13 +270,13 @@ class SurvivalModel(nn.Module):
         print(np.mean(predictions, axis=0))
         plt.plot(times, np.mean(predictions, axis=0))
         plt.title('Average Survival Curve')
-        plt.xlabel('Time') # Converted back to real scale not 0 to 1
+        plt.xlabel('Time') 
         plt.ylabel('Survival Probability')
         plt.show()
 
     def log_likelihood_loss(self, events_observed, times_tensor, predictions, X=None):
         """
-        Compute loss function as log liklihood loss. Ref slide 29 of Lecture 3.
+        Compute loss function as log liklihood loss. Ref slide 29 of Lecture 3. 
 
         Parameters:
             events: Tensor of event indicators of shape (N, 1), implementent as censoring indicator.
@@ -258,8 +285,9 @@ class SurvivalModel(nn.Module):
             X: needed only if domain adaptation model is used.
         """
         order = torch.argsort(times_tensor, descending=False)#.numpy() # Sort times in ascending order
-        E = 1 - events_observed[order] # because the model has events as censored
-        E = E.unsqueeze(1) # Shape (N, 1)
+        E = events_observed[order] 
+        if E.dim() == 1:
+            E = E.unsqueeze(1)  # Add a dimension if E is 1D
         predictions = predictions[order] # shape (N, 1)
 
         # Weights for domain adaptation
@@ -279,6 +307,39 @@ class SurvivalModel(nn.Module):
 
         log_likelihood = hazard_term + survival_term
         return log_likelihood
+    
+    def partial_log_likelihood_loss(self, events_observed, times_tensor, predictions, X=None):
+        """
+        Compute loss function as log liklihood loss. Ref slide 29 of Lecture 3. 
+
+        Parameters:
+            events: Tensor of event indicators of shape (N, 1), implementent as censoring indicator.
+            times: Tensor of observed times of shape (N, 1)
+            predictions: the output of the forward pass, i.e. the hazard at time T_i given X_i, beta
+            X: needed only if domain adaptation model is used.
+        """
+        order = torch.argsort(times_tensor, descending=False)#.numpy() # Sort times in ascending order
+        E = events_observed[order]
+        if E.dim() == 1:
+            E = E.unsqueeze(1)  # Add a dimension if E is 1D
+        predictions = predictions[order] # shape (N, 1)
+
+        # Weights for domain adaptation
+        weights = torch.ones_like(E) # Default to 1
+        if self.domain_adapatation_model is not None:
+            # Domain adaptation model predicts probability X is is from uncensored data
+            g = self.domain_adapatation_model(X) + 1e-6 # X is shape (N, |X|) so g is shape (N, 1)
+            
+            # We implement weight which adds higher weight to uncensored data, per slide 32 of Lecture 4
+            weights = torch.tensor(torch.clamp((1-g)/g,min=0.0,max=10.0), dtype=torch.float32) # Shape (N, 1)
+        
+        risk_set = torch.cumsum(torch.exp(predictions.flip(dims=(0,))), dim=0).flip(dims=(0,))  # Cumsum from largest to smallest
+
+        hazard_term = torch.sum(weights * E * predictions)
+        survival_term = torch.sum(weights * E * torch.log(risk_set + 1e-6))  # Risk set sum
+
+        partial_log_likelihood = hazard_term - survival_term
+        return partial_log_likelihood
     
     def concordance_index(self, test_df=None):
         """

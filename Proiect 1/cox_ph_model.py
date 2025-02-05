@@ -41,7 +41,7 @@ class custom_cox_model:
         covariates: list of column names for covariates
     """
     def __init__(self, df, covariates, event_col='DEATH_EVENT', time_col='time',
-                 learning_rate=0.01, num_epochs=100):
+                 learning_rate=0.001, num_epochs=200):
         
         # Data parameters
         self.df = df
@@ -175,6 +175,7 @@ class custom_cox_model:
         return pd.DataFrame({'covariate': self.covariates, 
                              'hazard_ratio': np.exp(self.betas),
                              'beta': self.betas}) 
+                             
                              #'CI_low': self.betas - 1.96 * np.sqrt(np.diag(self.cov_matrix)),
                              #'CI_high': self.betas + 1.96 * np.sqrt(np.diag(self.cov_matrix))})
 
