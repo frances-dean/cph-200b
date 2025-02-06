@@ -38,9 +38,9 @@ class SurvivalModel(nn.Module):
                 hidden_dims = [256, 256],
                 num_layers = [5, 5],
                 use_bn = True,
-                learning_rate = 0.0001,
+                learning_rate = 0.001,
                 censor_col='Censor (Censor = 1)', time_col='Survival Time',
-                domain_adapatation_model = None):
+                domain_adapatation_model = None, loss='coxph'):
         super(SurvivalModel, self).__init__()
         print('Hazard model initializing...')
 
@@ -111,6 +111,9 @@ class SurvivalModel(nn.Module):
         # Domain adaptation model - None if not used
         self.domain_adapatation_model = domain_adapatation_model
 
+        # Loss function ...
+        self.loss = loss
+
         print('SurvivalModel initialized.')
 
     def forward(self, combined_tensor):
@@ -163,14 +166,18 @@ class SurvivalModel(nn.Module):
                 
                 # Loss
                 # tried full log likelihood
-                #loss = -self.log_likelihood_loss(events_observed, durations, predictions, X[i:i+batch_size]) 
+                if self.loss=='full_log_likelihood':
+                    loss = -self.log_likelihood_loss(events_observed, durations, predictions, X[i:i+batch_size]) 
+                
                 # concordance doesn't work
                 #loss = 1-self.faster_concordance_index()
-                
-                # partial log likelihood works
-                if self.domain_adapatation_model is None:
+            
+                # # partial log likelihood works ?
+                    
+                if self.loss=='coxph':
                     loss = CoxPHLoss()(predictions, durations, events_observed)
-                else:
+
+                if self.loss=='partial_log_likelihood':
                     loss = -self.partial_log_likelihood_loss(events_observed, durations, predictions, X[i:i+batch_size]) 
                 
                 # Backward pass
@@ -261,10 +268,13 @@ class SurvivalModel(nn.Module):
             df = test_df
         else:
             df = self.df
-
+        
         X = torch.tensor(df[self.covariates].values, dtype=torch.float32)
         times = np.linspace(0, self.max_time, num=20)
-        predictions = self.compute_survival_from_hazard(self.predict(X)).detach().numpy() # Shape (N, 20) for default 20 time points
+
+        with torch.no_grad():
+            predictions = self.compute_survival_from_hazard(self.predict(X)).detach().numpy() # Shape (N, 20) for default 20 time points
+        
         plt.figure(figsize=(10, 6))
         # Plot average survival curve (compute mean across all data points)
         print(np.mean(predictions, axis=0))
@@ -333,12 +343,15 @@ class SurvivalModel(nn.Module):
             # We implement weight which adds higher weight to uncensored data, per slide 32 of Lecture 4
             weights = torch.tensor(torch.clamp((1-g)/g,min=0.0,max=10.0), dtype=torch.float32) # Shape (N, 1)
         
-        risk_set = torch.cumsum(torch.exp(predictions.flip(dims=(0,))), dim=0).flip(dims=(0,))  # Cumsum from largest to smallest
-
+        # Sum predictions over the events that haven't occurred yet "risk set"
+        #risk_set = torch.cumsum(torch.exp(predictions.flip(dims=(0,))), dim=0).flip(dims=(0,))  # Cumsum from largest to smallest
+        # "numerically stable??"
+        risk_set = torch.logcumsumexp(predictions.flip(dims=(0,)), dim=0).flip(dims=(0,))
+        
         hazard_term = torch.sum(weights * E * predictions)
-        survival_term = torch.sum(weights * E * torch.log(risk_set + 1e-6))  # Risk set sum
+        survival_term = torch.sum(weights * E * risk_set )  # Risk set sum # torch.log(<> + 1e-6)
 
-        partial_log_likelihood = hazard_term - survival_term
+        partial_log_likelihood = (hazard_term - survival_term)/torch.sum(E)
         return partial_log_likelihood
     
     def concordance_index(self, test_df=None):
