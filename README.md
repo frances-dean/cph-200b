@@ -26,4 +26,21 @@ This repository hosts the class projects for CPH 200B offered at UC Berkeley and
     <li>Task 1.4: Handling Informative Censoring via Domain Adaptation [8 pts]</li> 
   </ul>
 
+</details> 
+
+#### [Project 2: Machine Learning-based Causal Effect Estimation (30 points)](https://bcourses.berkeley.edu/courses/1541195) 
+
+<details>
+  <summary><b>Tasks and Grading</b> (click to expand)</summary>
+  &nbsp;
+  <ul>
+    <li>Task 2.1: Warm-up Exercise: Hypothesis Testing & Confounding [6 pts]</a></li>
+    &nbsp;
+    <li>Task 2.2: ML-based Estimation of Average Treatment Effects [6 pts]</li> 
+    &nbsp;
+    <li>Task 2.3: Counterfactual Inference and Domain Adaptation [8 pts]</li> 
+    &nbsp;
+    <li>Task 2.4: NeurIPS Reviewer for a Day: Reviewing & Reproducing Recent Research on ML-Based Causal Inference [10 pts]</li> 
+  </ul>
+
 </details>
