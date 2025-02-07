@@ -1,10 +1,12 @@
 # Ignore data
-data/
+Project1/data/
+Project2/data/
 
 
 
 # Byte-compiled / optimized / DLL files
-__pycache__/
+Project1/__pycache__/
+Project2/__pycache__/
 *.py[cod]
 *$py.class
 
