@@ -2,7 +2,8 @@
 Project1/data/
 Project2/data/
 Project2/pdfs/
-
+**/data/
+**/pdfs/
 
 
 # Byte-compiled / optimized / DLL files
