@@ -60,14 +60,14 @@ def log_rank_test(df,
         return ((N - n) * n * k * (N - k)) / (N**2 * (N - 1))
     
     top, bottom = 0, 0
-    for t in df[duration_col].unique(): 
+    for t in sorted(df[duration_col].unique()): 
         data = df[df[duration_col]>=t] # Subset to those remaining in risk set
         group0, group1 = data[data[group_variable]==0], data[data[group_variable]==1]
 
         # group d_{t,1} whose event happened at time t in treatment group
         d = len(group1[(group1[duration_col]==t) & (group1[censor_col]==0)])
         # d_t group whose event happened at time t in population
-        k = len(data[data[censor_col]==0])
+        k = len(data[(data[duration_col]==t)&(data[censor_col]==0)])
         # total population
         N = len(group0) + len(group1)
         # at risk population in treatment gorup
@@ -76,6 +76,8 @@ def log_rank_test(df,
             continue
         top += d - hypergeo_mean(N, n, k)
         bottom += hypergeo_var(N, n, k)
+        print(d, k, N, n)
+        print(hypergeo_mean(N, n, k), hypergeo_var(N, n, k))
 
     # Mantel-Haenszel is normally distributed
     Z = top/np.sqrt(bottom)
@@ -122,7 +124,7 @@ def weighted_log_rank_test(df,
         d = group1.loc[(group1[duration_col] == t) & (group1[censor_col] == 0), 'weight'].sum()
 
         # d_t group whose event happened at time t in population
-        k = data.loc[data[censor_col] == 0, 'weight'].sum()
+        k = data.loc[(data[duration_col]==t)&(data[censor_col] == 0), 'weight'].sum()
 
         # total population
         N = data['weight'].sum()
