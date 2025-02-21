@@ -19,24 +19,34 @@ import matplotlib.pyplot as plt
 #######################################################################################
 
 ## TARNet or CFRMMD depending on alpha ##
-class TARNet():
+class TARNet(nn.Module):
     def __init__(self, df, covariate_cols=['X1','X2','X3','X4','X5','X6','X7','X8','X9','X10',
                                            'X11','X12','X13','X14','X15','X16','X17','X18','X19','X20',
                                            'X21','X22','X23','X24','X25'],
-                                           treatment_col='T', label_col='Y', alpha=0, lambda_=0):
+                                           treatment_col='T', label_col='Y', alpha=0, lambda_=0,
+                                           lr=0.001):
+        super(TARNet, self).__init__() 
+        
         # Data parameters
         self.df = df
         self.covariate_cols = covariate_cols
         self.treatment_col = treatment_col
         self.label_col = label_col
+        self.lr = lr
         
         # Loss hyperparameters
         self.lambda_ = lambda_
         self.alpha = alpha
         
-        self.u = sum(self.df[self.treatment_col].values)/len(self.df[self.treatment_col].values)
+        self.u = max(1e-6, min(1 - 1e-6, sum(self.df[self.treatment_col].values) / len(self.df[self.treatment_col].values)))
+        print(f'u: {self.u}')
         self.input_dim = len(covariate_cols)
         self.output_dim = 1 # for each arm we predict a single value, Y_hat
+        self.hidden_dim = 200
+        
+        # # Device
+        # self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        # self.to(self.device)
 
         # Layers:
         # "CFR is implemented as a feed-forward
@@ -46,92 +56,146 @@ class TARNet():
         # for the representation and hypothesis used for IHDP.""
         
         self.representation_layers = nn.Sequential(
-            nn.Linear(self.input_dim, 200),
+            nn.Linear(self.input_dim, self.hidden_dim),
+            nn.BatchNorm1d(self.hidden_dim), 
             nn.ELU(),
-            nn.Linear(200, 100),
+            nn.Linear(self.hidden_dim, self.hidden_dim),
+            nn.BatchNorm1d(self.hidden_dim), 
             nn.ELU(),
-            nn.Linear(100, 100)
+            nn.Linear(self.hidden_dim, self.hidden_dim),
+            nn.BatchNorm1d(self.hidden_dim), 
+            nn.ELU(),
         )
         self.control_arm = nn.Sequential(
-            nn.Linear(100, 200),
+            nn.Linear(self.hidden_dim, self.hidden_dim),
+            nn.BatchNorm1d(self.hidden_dim), 
             nn.ReLU(),
-            nn.Linear(200, 100),
-            nn.ELU(),
-            nn.Linear(100, self.output_dim)
+            nn.Linear(self.hidden_dim, self.hidden_dim),
+            nn.BatchNorm1d(self.hidden_dim), 
+            nn.ReLU(),
+            nn.Linear(self.hidden_dim, self.output_dim)
         )
         self.treatment_arm = nn.Sequential(
-            nn.Linear(100, 200),
+            nn.Linear(self.hidden_dim, self.hidden_dim),
+            nn.BatchNorm1d(self.hidden_dim), 
             nn.ReLU(),
-            nn.Linear(200, 100),
-            nn.ELU(),
-            nn.Linear(100, self.output_dim)
+            nn.Linear(self.hidden_dim, self.hidden_dim),
+            nn.BatchNorm1d(self.hidden_dim), 
+            nn.ReLU(),
+            nn.Linear(self.hidden_dim, self.output_dim)
+            
         )
+        # The model is trained using Adam's (Kingma & Ba, 2014). 
+        self.optimizer = optim.Adam(
+                               list(self.representation_layers.parameters())+
+                               list(self.control_arm.parameters())+
+                               list(self.treatment_arm.parameters()), lr=self.lr)
+        # optimizer_representation = optim.Adam(list(self.representation_layers.parameters()), lr=lr)
+        # optimizer_control = optim.Adam(list(self.control_arm.parameters()), lr=lr)
+        # optimizer_treatment = optim.Adam(list(self.treatment_arm.parameters()), lr=lr)
+    
+        
+        
+        # For continuous data we use mean squared loss and for binary data, we'd use log-loss.
+        self.prediction_loss = nn.MSELoss()
 
-        # For continuous data we use mean squared loss and for binary data, we use log-loss.
-        self.prediction_loss = nn.MSELoss(reduction='none')
+        print(self)
 
         # Ignore regularization for now
         # self.regularizing_term = self.lambda_ * torch.norm(self.weights, p=2) 
         
         # loss = self.hypothesis_loss + self.regularizing_term + self.IPM_penalty_loss
 
-    def forward(self, X):
+    def forward(self, X, t):
 
         representation = self.representation_layers(X)
-        y0_pred = self.control_arm(representation)
-        y1_pred = self.treatment_arm(representation)
-        return representation, y0_pred, y1_pred
+        control_out = self.control_arm(representation)
+        treatment_out = self.treatment_arm(representation)
+        y_pred = t * treatment_out + (1 - t) * control_out
         
-    def fit(self, epochs=100, lr=0.001):
+        return y_pred
+        
+    def fit(self, epochs=10, batch_size=64):
+        # Set to training mode
+        self.representation_layers.train()
+        self.treatment_arm.train()
+        #self.control_arm.train()
 
         # Get data
-        X = torch.tensor(self.df[self.covariate_cols].values, dtype=torch.float32)
-        y = torch.tensor(self.df[self.label_col].values, dtype=torch.float32)
-        t = torch.tensor(self.df[self.treatment_col].values, dtype=torch.float32)
-
-        # The model is trained using Adam (Kingma & Ba, 2014). 
-        optimizer_representation = optim.Adam(self.representation_layers.parameters(), lr=lr)
-        optimizer_control = optim.Adam(self.control_arm.parameters(), lr=lr)
-        optimizer_treatment = optim.Adam(self.treatment_arm.parameters(), lr=lr)
-    
         
+        print('data:')
+        try:
+            X = torch.tensor(self.df[self.covariate_cols].values, dtype=torch.float32)
+            y = torch.tensor(self.df[self.label_col].values, dtype=torch.float32)
+            t = torch.tensor(self.df[self.treatment_col].values, dtype=torch.float32)
+            # X = X.to(self.device)
+            # y = y.to(self.device)
+            # t = t.to(self.device)
+        except Exception as e:
+            print(e)
+            print('error')
+        print(f'data shapes: {X.shape}, {y.shape}, {t.shape}')
+        
+        print('starting training')
         for epoch in range(epochs):
-            optimizer_representation.zero_grad()
-            optimizer_control.zero_grad()
-            optimizer_treatment.zero_grad()
+            print(epoch)
 
-            representation, y0_pred, y1_pred = self.forward(X)
+            # Shuffle data
+            indices = torch.randperm(len(X))
+            X = X[indices]
+            y = y[indices]
+            t = t[indices]
 
-            # Calculate weights
-            weights = t/ 2*self.u + (1 - t) / 2*(1 - self.u)
+            batch_size = 64
+            # Batch data
+            for i in range(0, len(X), batch_size):
+                X_batch = X[i:i + batch_size]
+                y_batch = y[i:i + batch_size]
+                t_batch = t[i:i + batch_size]
 
-            # Calculate loss
-            control_conditon = (t == 0)
-            treatment_condition = (t == 1)
-            loss_y0 = (weights * self.prediction_loss(y0_pred[control_conditon], y[control_conditon])).mean() # +  add other loss later
-            loss_y1 = (weights * self.prediction_loss(y1_pred[treatment_condition], y[treatment_condition])).mean() # +  add other loss later
+                try:
+                    # Zero gradients
+                    self.optimizer.zero_grad()
+                    # optimizer_representation.zero_grad()
+                    # optimizer_control.zero_grad()
+                    # optimizer_treatment.zero_grad()
 
-            representation_control = representation[control_conditon]
-            representation_treatment = representation[treatment_condition]
+                    y_pred = self.forward(X_batch, t_batch)
+                except Exception as e:
+                    print(e)
+                    print('error')
 
-            loss_pred = loss_y0 + loss_y1  # Prediction loss
+                # Calculate weights
+                weights = (t_batch / (2 * self.u)) + ((1 - t_batch) / (2 * (1 - self.u)))
+                # print(weights)
+                
+                # Calculate prediction loss
+                loss = torch.mean(weights * self.prediction_loss(y_pred, y_batch))
+                #print(f'loss_prediction: {loss}')
 
-            # Squared Linear MMD = IPM loss example -- idk what they even use in the paper
-            loss_ipm = self.alpha * torch.norm(representation_control.mean() - representation_treatment.mean(), p=2) ** 2 
+                # representation_control = representation[control_conditon]
+                # representation_treatment = representation[treatment_condition]
 
-            # Backpropagate both prediction loss (through all layers) and IPM loss (through representation layers)
-            loss_pred.backward()  # Prediction loss affects all layers
-            optimizer_representation.step()  # Update representation layers (affects both prediction and MMD)
+                #loss_pred = loss_y0 + loss_y1  # Prediction loss
 
-            loss_ipm.backward()  # IPM loss only affects representation layers
-            optimizer_control.step()  # Update control prediction head
-            optimizer_treatment.step()  # Update treatment prediction head
+                # Squared Linear MMD = IPM loss example -- idk what they even use in the paper
+                #loss_ipm = self.alpha * torch.norm(representation_control.mean() - representation_treatment.mean(), p=2) ** 2 
+                
+                #loss_total = loss_pred + loss_ipm
+                # Backpropagate both prediction loss (through all layers) and IPM loss (through representation layers)
+                loss.backward()  # Prediction loss affects all layers
+                
+                # optimizer_representation.step()  # Update representation layers (affects both prediction and MMD)
+                # optimizer_control.step()  # Update control prediction head
+                # optimizer_treatment.step()  # Update treatment prediction head
+                self.optimizer.step()
+                # Print loss
 
-            # Print loss
             if epoch % 10 == 0:
-                print(f'Epoch: {epoch}, Loss IPM: {loss_ipm.item()}, Prediction Loss: {loss_pred.item()}')
+                print(f'Epoch: {epoch}, Prediction Loss: {loss.item()}')
             
     def predict(self, X):
+        self.eval()
         return self.model(X)
     
     def plot_representation_space(self, n_components=2):
