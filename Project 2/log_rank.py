@@ -76,8 +76,8 @@ def log_rank_test(df,
             continue
         top += d - hypergeo_mean(N, n, k)
         bottom += hypergeo_var(N, n, k)
-        print(d, k, N, n)
-        print(hypergeo_mean(N, n, k), hypergeo_var(N, n, k))
+        #print(d, k, N, n)
+        #print(hypergeo_mean(N, n, k), hypergeo_var(N, n, k))
 
     # Mantel-Haenszel is normally distributed
     Z = top/np.sqrt(bottom)
