@@ -24,7 +24,7 @@ class TARNet(nn.Module):
     def __init__(self, df, covariate_cols=['X1','X2','X3','X4','X5','X6','X7','X8','X9','X10',
                                            'X11','X12','X13','X14','X15','X16','X17','X18','X19','X20',
                                            'X21','X22','X23','X24','X25'],
-                                           treatment_col='T', label_col='Y', alpha=0, lambda_=0,
+                                           treatment_col='T', label_col='Y', ite_label='ITE',alpha=0, lambda_=0,
                                            lr=0.001):
         super(TARNet, self).__init__() 
         
@@ -33,6 +33,7 @@ class TARNet(nn.Module):
         self.covariate_cols = covariate_cols
         self.treatment_col = treatment_col
         self.label_col = label_col
+        self.ite_label = ite_label
         self.lr = lr
         self.df, self.test_df = train_test_split(self.df, test_size=0.2, random_state=42)
         
@@ -60,54 +61,50 @@ class TARNet(nn.Module):
         
         self.representation_layers = nn.Sequential(
             nn.Linear(self.input_dim, self.hidden_dim),
-            nn.BatchNorm1d(self.hidden_dim), 
+            #nn.BatchNorm1d(self.hidden_dim), 
             nn.ELU(),
             nn.Linear(self.hidden_dim, self.hidden_dim),
-            nn.BatchNorm1d(self.hidden_dim), 
+            #nn.BatchNorm1d(self.hidden_dim), 
             nn.ELU(),
             nn.Linear(self.hidden_dim, self.hidden_dim),
-            nn.BatchNorm1d(self.hidden_dim), 
+            #nn.BatchNorm1d(self.hidden_dim), 
             nn.ELU(),
         )
         self.control_arm = nn.Sequential(
             nn.Linear(self.hidden_dim, self.hidden_dim),
-            nn.BatchNorm1d(self.hidden_dim), 
-            nn.ReLU(),
+            #nn.BatchNorm1d(self.hidden_dim), 
+            nn.ELU(),
             nn.Linear(self.hidden_dim, self.hidden_dim),
-            nn.BatchNorm1d(self.hidden_dim), 
-            nn.ReLU(),
+            #nn.BatchNorm1d(self.hidden_dim), 
+            nn.ELU(),
             nn.Linear(self.hidden_dim, self.output_dim)
         )
         self.treatment_arm = nn.Sequential(
             nn.Linear(self.hidden_dim, self.hidden_dim),
-            nn.BatchNorm1d(self.hidden_dim), 
-            nn.ReLU(),
+            #nn.BatchNorm1d(self.hidden_dim), 
+            nn.ELU(),
             nn.Linear(self.hidden_dim, self.hidden_dim),
-            nn.BatchNorm1d(self.hidden_dim), 
-            nn.ReLU(),
+            #nn.BatchNorm1d(self.hidden_dim), 
+            nn.ELU(),
             nn.Linear(self.hidden_dim, self.output_dim)
             
         )
         # The model is trained using Adam's (Kingma & Ba, 2014). 
-        self.optimizer = optim.Adam(
-                               list(self.representation_layers.parameters())+
-                               list(self.control_arm.parameters())+
-                               list(self.treatment_arm.parameters()), lr=self.lr)
-        # optimizer_representation = optim.Adam(list(self.representation_layers.parameters()), lr=lr)
-        # optimizer_control = optim.Adam(list(self.control_arm.parameters()), lr=lr)
-        # optimizer_treatment = optim.Adam(list(self.treatment_arm.parameters()), lr=lr)
+        # self.optimizer = optim.Adam(
+        #                        list(self.representation_layers.parameters())+
+        #                        list(self.control_arm.parameters())+
+        #                        list(self.treatment_arm.parameters()), lr=self.lr)
+        self.optimizer_representation = optim.Adam(list(self.representation_layers.parameters()), lr=lr)
+        self.optimizer_control = optim.Adam(list(self.control_arm.parameters()), lr=lr)
+        self.optimizer_treatment = optim.Adam(list(self.treatment_arm.parameters()), lr=lr)
     
         
         
         # For continuous data we use mean squared loss and for binary data, we'd use log-loss.
         self.prediction_loss = nn.MSELoss()
 
-        print(self)
-
-        # Ignore regularization for now
-        # self.regularizing_term = self.lambda_ * torch.norm(self.weights, p=2) 
         
-        # loss = self.hypothesis_loss + self.regularizing_term + self.IPM_penalty_loss
+
 
     def forward(self, X, t):
 
@@ -155,25 +152,24 @@ class TARNet(nn.Module):
                 y_batch = y[i:i + batch_size]
                 t_batch = t[i:i + batch_size]
 
-                try:
-                    # Zero gradients
-                    self.optimizer.zero_grad()
-                    # optimizer_representation.zero_grad()
-                    # optimizer_control.zero_grad()
-                    # optimizer_treatment.zero_grad()
+               
+                # Zero gradients
+                #self.optimizer.zero_grad()
+                self.optimizer_representation.zero_grad()
+                self.optimizer_control.zero_grad()
+                self.optimizer_treatment.zero_grad()
 
-                    y_pred, representation, _, _ = self.forward(X_batch, t_batch)
-                except Exception as e:
-                    print(e)
-                    print('error')
+                y_pred, representation, _, _ = self.forward(X_batch, t_batch)
+                
 
                 # Calculate weights
                 weights = (t_batch / (2 * self.u)) + ((1 - t_batch) / (2 * (1 - self.u)))
                 # print(weights)
                 
                 # Calculate prediction loss
-                loss = torch.mean(weights * self.prediction_loss(y_pred, y_batch))
+                loss_pred = torch.mean(weights * self.prediction_loss(y_pred, y_batch))
                 #print(f'loss_prediction: {loss}')
+                #loss = loss_pred.clone()
                 
                 control_condition = (t_batch==0)
                 
@@ -184,16 +180,31 @@ class TARNet(nn.Module):
 
                 # Squared Linear MMD = IPM loss example -- idk what they even use in the paper
                 loss_ipm = self.alpha * torch.norm(representation_control.mean() - representation_treatment.mean(), p=2) ** 2 
-                loss += loss_ipm
+                #loss = loss.clone() + loss_ipm
                 
-                #loss_total = loss_pred + loss_ipm
+                # Regularizing loss
+                # Ignore regularization for now
+                #regularizing_term = self.lambda_ * torch.norm(self.weights, p=2) 
+                #loss += regularizing_term
+
+                # Backpropagate **only** prediction loss (updates all optimizers)
+                loss_pred.backward(retain_graph=True)
+                #self.optimizer_representation.step()
+                self.optimizer_control.step()
+                self.optimizer_treatment.step()
+
+                # Backpropagate **only** IPM loss (updates only representation layers)
+                #self.optimizer_representation.zero_grad()  # Zero out before IPM step
+                #loss = loss_pred.clone() + loss_ipm
+                loss_ipm.backward()
+                self.optimizer_representation.step()
+                
                 # Backpropagate both prediction loss (through all layers) and IPM loss (through representation layers)
-                loss.backward()  # Prediction loss affects all layers
+                # loss.backward()  
+                # self.optimizer.step()
                 
-                # optimizer_representation.step()  # Update representation layers (affects both prediction and MMD)
-                # optimizer_control.step()  # Update control prediction head
-                # optimizer_treatment.step()  # Update treatment prediction head
-                self.optimizer.step()
+                loss = loss_pred + loss_ipm
+                
                 epoch_losses.append(loss.item())
             
             avg_loss = sum(epoch_losses) / len(epoch_losses)
@@ -201,26 +212,49 @@ class TARNet(nn.Module):
             losses.append(avg_loss)
 
             if epoch % 10 == 0:
-                print(f'Epoch: {epoch}, Loss: {loss.item()}')
+                print('')
+                print(f'Epoch: {epoch}, Loss: {loss_pred.item()}')
         print('done training')
         return losses
         
             
-    def predict_test(self):
+    def predict_train(self, use_ite=False):
+        X = torch.tensor(self.df[self.covariate_cols].astype(float).values, dtype=torch.float32)
+        y = torch.tensor(self.df[self.label_col].values, dtype=torch.float32)
+        t = torch.tensor(self.df[self.treatment_col].values, dtype=torch.float32)
+        X = X.to(self.device)
+        y = y.to(self.device)
+        t = t.to(self.device)
+        if use_ite:
+            ite = torch.tensor(self.df[self.ite_label].astype(float).values, dtype=torch.float32)
+        else:
+            ite = None
+        self.eval()  # Set model to evaluation mode
+        with torch.no_grad():  # No gradients needed for prediction
+            return self.forward(X,t), X, y, t, ite
+    
+    def predict_test(self, use_ite=False):
         X = torch.tensor(self.test_df[self.covariate_cols].astype(float).values, dtype=torch.float32)
         y = torch.tensor(self.test_df[self.label_col].values, dtype=torch.float32)
         t = torch.tensor(self.test_df[self.treatment_col].values, dtype=torch.float32)
         X = X.to(self.device)
         y = y.to(self.device)
         t = t.to(self.device)
+        if use_ite:
+            ite = torch.tensor(self.test_df[self.ite_label].astype(float).values, dtype=torch.float32)
+        else:
+            ite = None
         self.eval()  # Set model to evaluation mode
         with torch.no_grad():  # No gradients needed for prediction
-            return self.forward(X,t), X, y, t
+            return self.forward(X,t), X, y, t, ite
     
     # plot the t-sne
-    def plot_representation_space(self, representation, t, n_components=2):
+    def plot_representation_space(self, representation=None, t=None, n_components=2):
         """Plot the representation space"""
         
+        if representation is None:
+            representation = torch.tensor(self.df[self.covariate_cols].astype(float).values, dtype=torch.float32)
+            t = torch.tensor(self.df[self.treatment_col].values, dtype=torch.float32)
         # Index on what is control versus treatment
         representation_control = representation[t == 0]
         representation_treatment = representation[t == 1]
@@ -241,10 +275,13 @@ class TARNet(nn.Module):
         plt.legend()
         plt.show()
     
-    def compute_PEHE_ATE_metrics(self, control_output, treatment_output, t, y):
+    def compute_PEHE_ATE_metrics(self, control_output, treatment_output, t, ite=None):
         """Compute comparison metrics"""
         ite_pred = treatment_output - control_output 
-        ite_true = torch.where(t == 1, y, -y)
+        if ite is not None:
+            ite_true = ite 
+        else:
+            ite_true = torch.where(t == 1, y, -y)
         #print(ite_pred, ite_true)
         pehe = torch.mean((ite_pred - ite_true) ** 2)
         #print(pehe)
@@ -253,7 +290,7 @@ class TARNet(nn.Module):
         ate_true = torch.mean(ite_true)  
         ate_error = torch.abs(ate_pred - ate_true)
         
-        return pehe.item(), ate_error.item(), ite_pred, ate_pred
+        return pehe.item(), ate_error.item(), ite_pred, ate_pred 
 
 #######################################################################################
 
