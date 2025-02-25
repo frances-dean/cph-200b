@@ -24,8 +24,9 @@ class TARNet(nn.Module):
     def __init__(self, df, covariate_cols=['X1','X2','X3','X4','X5','X6','X7','X8','X9','X10',
                                            'X11','X12','X13','X14','X15','X16','X17','X18','X19','X20',
                                            'X21','X22','X23','X24','X25'],
-                                           treatment_col='T', label_col='Y', ite_label='ITE',alpha=0, lambda_=0,
-                                           lr=0.001):
+                                           treatment_col='T', label_col='Y', ite_label='ITE',alpha=0, lambda_=0,beta=1,
+                                           weight_decay=0.01,
+                                           lr=0.001, verbose=False, target_reg=False):
         super(TARNet, self).__init__() 
         
         # Data parameters
@@ -37,9 +38,13 @@ class TARNet(nn.Module):
         self.lr = lr
         self.df, self.test_df = train_test_split(self.df, test_size=0.2, random_state=42)
         
+        self.verbose = verbose
+        
         # Loss hyperparameters
         self.lambda_ = lambda_
         self.alpha = alpha
+        self.target_reg = target_reg
+        self.beta = beta
         
         self.u = max(1e-6, min(1 - 1e-6, sum(self.df[self.treatment_col].values) / len(self.df[self.treatment_col].values)))
         print(f'u: {self.u}')
@@ -89,22 +94,20 @@ class TARNet(nn.Module):
             nn.Linear(self.hidden_dim, self.output_dim)
             
         )
+        
+        self.epsilon = nn.Parameter(torch.tensor(1.0))
+        
         # The model is trained using Adam's (Kingma & Ba, 2014). 
         # self.optimizer = optim.Adam(
         #                        list(self.representation_layers.parameters())+
         #                        list(self.control_arm.parameters())+
         #                        list(self.treatment_arm.parameters()), lr=self.lr)
-        self.optimizer_representation = optim.Adam(list(self.representation_layers.parameters()), lr=lr)
-        self.optimizer_control = optim.Adam(list(self.control_arm.parameters()), lr=lr)
-        self.optimizer_treatment = optim.Adam(list(self.treatment_arm.parameters()), lr=lr)
+        self.optimizer_representation = optim.Adam(list(self.representation_layers.parameters()) + [self.epsilon], lr=lr, weight_decay=weight_decay)
+        self.optimizer_control = optim.Adam(list(self.control_arm.parameters()), lr=lr, weight_decay=weight_decay)
+        self.optimizer_treatment = optim.Adam(list(self.treatment_arm.parameters()), lr=lr, weight_decay=weight_decay)
     
-        
-        
         # For continuous data we use mean squared loss and for binary data, we'd use log-loss.
         self.prediction_loss = nn.MSELoss()
-
-        
-
 
     def forward(self, X, t):
 
@@ -123,6 +126,7 @@ class TARNet(nn.Module):
 
         # Get data
         losses = []
+        val_losses = []
         print('data:')
         
         X = torch.tensor(self.df[self.covariate_cols].astype(float).values, dtype=torch.float32)
@@ -137,7 +141,6 @@ class TARNet(nn.Module):
         print('starting training')
         for epoch in range(epochs):
             epoch_losses = []
-            print(epoch)
 
             # Shuffle data
             indices = torch.randperm(len(X))
@@ -186,6 +189,11 @@ class TARNet(nn.Module):
                 # Ignore regularization for now
                 #regularizing_term = self.lambda_ * torch.norm(self.weights, p=2) 
                 #loss += regularizing_term
+                
+                if self.target_reg:
+                    target = y_batch - y_pred + self.epsilon*(t_batch/ self.u + (1-t_batch)/(1-self.u))
+                    loss_target = self.beta * torch.mean(target)
+                    loss_pred += loss_target
 
                 # Backpropagate **only** prediction loss (updates all optimizers)
                 loss_pred.backward(retain_graph=True)
@@ -211,13 +219,29 @@ class TARNet(nn.Module):
             
             losses.append(avg_loss)
 
-            if epoch % 10 == 0:
+            if epoch % 10 == 0 and self.verbose:
                 print('')
                 print(f'Epoch: {epoch}, Loss: {loss_pred.item()}')
-        print('done training')
-        return losses
-        
+                
             
+            # Calculate test set loss
+            test_X = torch.tensor(self.test_df[self.covariate_cols].astype(float).values, dtype=torch.float32).to(self.device)
+            test_y = torch.tensor(self.test_df[self.label_col].values, dtype=torch.float32).to(self.device)
+            test_t = torch.tensor(self.test_df[self.treatment_col].values, dtype=torch.float32).to(self.device)
+
+            self.eval()
+            with torch.no_grad():
+                test_y_pred, _, _, _ = self.forward(test_X, test_t)
+                test_loss = self.prediction_loss(test_y_pred, test_y).item()
+                val_losses.append(test_loss)
+                print(f'Test set loss: {test_loss}')
+                
+        print('done training')
+        
+
+        return losses, val_losses
+        
+           
     def predict_train(self, use_ite=False):
         X = torch.tensor(self.df[self.covariate_cols].astype(float).values, dtype=torch.float32)
         y = torch.tensor(self.df[self.label_col].values, dtype=torch.float32)
@@ -299,9 +323,10 @@ class Dragonnet(nn.Module):
     def __init__(self, df, covariate_cols=['X1','X2','X3','X4','X5','X6','X7','X8','X9','X10',
                                            'X11','X12','X13','X14','X15','X16','X17','X18','X19','X20',
                                            'X21','X22','X23','X24','X25'],
-                                           treatment_col='T', label_col='Y', target_reg=False,
-                                           lr=0.001, alpha=1, epsilon=1, beta = 1): 
-        # default alpha and beta from paper directly, not sure what epsilon should be
+                                           treatment_col='T', label_col='Y',ite_label='ITE', target_reg=False,
+                                           lr=0.001, alpha=1, beta = 1, weight_decay=0): 
+        # default alpha and beta from paper directly
+        # epsilon is learned
         super(Dragonnet, self).__init__() 
         
         # Data parameters
@@ -309,14 +334,16 @@ class Dragonnet(nn.Module):
         self.covariate_cols = covariate_cols
         self.treatment_col = treatment_col
         self.label_col = label_col
+        self.ite_label = ite_label
         self.lr = lr
         self.df, self.test_df = train_test_split(self.df, test_size=0.2, random_state=42)
         
         # Loss hyperparameters
         self.target_reg = target_reg
         self.alpha = alpha
-        self.epsilon=epsilon
+        self.epsilon=nn.Parameter(torch.tensor(1.0))
         self.beta = beta
+        self.weight_decay = weight_decay
         
         self.u = max(1e-6, min(1 - 1e-6, sum(self.df[self.treatment_col].values) / len(self.df[self.treatment_col].values)))
         print(f'u: {self.u}')
@@ -382,7 +409,8 @@ class Dragonnet(nn.Module):
                                list(self.representation_layers.parameters())+
                                list(self.control_arm.parameters())+
                                list(self.propensity_arm.parameters())+
-                               list(self.treatment_arm.parameters()), lr=self.lr)
+                               list(self.treatment_arm.parameters())+
+                               [self.epsilon], lr=self.lr, weight_decay=self.weight_decay)
         # optimizer_representation = optim.Adam(list(self.representation_layers.parameters()), lr=lr)
         # optimizer_control = optim.Adam(list(self.control_arm.parameters()), lr=lr)
         # optimizer_treatment = optim.Adam(list(self.treatment_arm.parameters()), lr=lr)
@@ -475,7 +503,7 @@ class Dragonnet(nn.Module):
 
                 #loss_pred = loss_y0 + loss_y1  # Prediction loss
 
-                # Squared Linear MMD = IPM loss example -- idk what they even use in the paper
+                # Propensity loss
                 print(propensity.shape)
                 loss_propensity = self.alpha * self.propensity_loss(propensity.squeeze(), t_batch)
                 loss += loss_propensity
@@ -505,21 +533,43 @@ class Dragonnet(nn.Module):
         return losses
         
             
-    def predict_test(self):
+    def predict_train(self, use_ite=False):
+        X = torch.tensor(self.df[self.covariate_cols].astype(float).values, dtype=torch.float32)
+        y = torch.tensor(self.df[self.label_col].values, dtype=torch.float32)
+        t = torch.tensor(self.df[self.treatment_col].values, dtype=torch.float32)
+        X = X.to(self.device)
+        y = y.to(self.device)
+        t = t.to(self.device)
+        if use_ite:
+            ite = torch.tensor(self.df[self.ite_label].astype(float).values, dtype=torch.float32)
+        else:
+            ite = None
+        self.eval()  # Set model to evaluation mode
+        with torch.no_grad():  # No gradients needed for prediction
+            return self.forward(X,t), X, y, t, ite
+    
+    def predict_test(self, use_ite=False):
         X = torch.tensor(self.test_df[self.covariate_cols].astype(float).values, dtype=torch.float32)
         y = torch.tensor(self.test_df[self.label_col].values, dtype=torch.float32)
         t = torch.tensor(self.test_df[self.treatment_col].values, dtype=torch.float32)
         X = X.to(self.device)
         y = y.to(self.device)
         t = t.to(self.device)
+        if use_ite:
+            ite = torch.tensor(self.test_df[self.ite_label].astype(float).values, dtype=torch.float32)
+        else:
+            ite = None
         self.eval()  # Set model to evaluation mode
         with torch.no_grad():  # No gradients needed for prediction
-            return self.forward(X,t), X, y, t
+            return self.forward(X,t), X, y, t, ite
     
     # plot the t-sne
-    def plot_representation_space(self, representation, t, n_components=2):
+    def plot_representation_space(self, representation=None, t=None, n_components=2):
         """Plot the representation space"""
         
+        if representation is None:
+            representation = torch.tensor(self.df[self.covariate_cols].astype(float).values, dtype=torch.float32)
+            t = torch.tensor(self.df[self.treatment_col].values, dtype=torch.float32)
         # Index on what is control versus treatment
         representation_control = representation[t == 0]
         representation_treatment = representation[t == 1]
@@ -540,10 +590,13 @@ class Dragonnet(nn.Module):
         plt.legend()
         plt.show()
     
-    def compute_PEHE_ATE_metrics(self, control_output, treatment_output, t, y):
+    def compute_PEHE_ATE_metrics(self, control_output, treatment_output, t, ite=None):
         """Compute comparison metrics"""
         ite_pred = treatment_output - control_output 
-        ite_true = torch.where(t == 1, y, -y)
+        if ite is not None:
+            ite_true = ite 
+        else:
+            ite_true = torch.where(t == 1, y, -y)
         #print(ite_pred, ite_true)
         pehe = torch.mean((ite_pred - ite_true) ** 2)
         #print(pehe)
@@ -552,4 +605,4 @@ class Dragonnet(nn.Module):
         ate_true = torch.mean(ite_true)  
         ate_error = torch.abs(ate_pred - ate_true)
         
-        return pehe.item(), ate_error.item(), ite_pred, ate_pred
+        return pehe.item(), ate_error.item(), ite_pred, ate_pred 
